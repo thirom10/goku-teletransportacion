@@ -50,6 +50,10 @@ export async function calibrateBackground({
 
   onCountdown?.(0);
 
+  // Margen para que la persona termine de salir del encuadre: si se captura
+  // mientras todavia esta moviendose, el fondo queda con un fantasma.
+  await delay(700, signal);
+
   for (let sample = 0; sample < sampleCount; sample += 1) {
     if (signal?.aborted) {
       throw new DOMException('Calibration aborted', 'AbortError');

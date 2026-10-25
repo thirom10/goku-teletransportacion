@@ -209,6 +209,15 @@ input:disabled {
   line-height: 1.35;
 }
 
+.audio-warning {
+  margin: 10px 0 0;
+  color: #ffc48f;
+  font-size: 0.76rem;
+  font-weight: 700;
+  line-height: 1.35;
+  word-break: break-all;
+}
+
 .countdown {
   display: grid;
   width: 52px;

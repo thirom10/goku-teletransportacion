@@ -13,6 +13,8 @@ import {
   formatVisionError,
 } from './services/visionService.js';
 import { GESTURE_STATES, GestureService, hasTwoFingerPose } from './services/gestureService.js';
+import { TeleportEffect } from './services/teleportEffect.js';
+import { TeleportAudioService } from './services/audioService.js';
 import CameraPanel from './components/CameraPanel.jsx';
 import CalibrationPanel from './components/CalibrationPanel.jsx';
 import VisibilityPanel from './components/VisibilityPanel.jsx';
@@ -22,15 +24,12 @@ import StatusGrid from './components/StatusGrid.jsx';
 
 const FRAME_WIDTH = 640;
 const FRAME_HEIGHT = 480;
-const SEGMENT_INTERVAL_MS = 180;
-const GESTURE_INTERVAL_MS = 160;
-const DEFAULT_TRANSITION_MS = 360;
-
-const visualParams = {
-  blurRadius: 3,
-  maskThreshold: 0.3,
-  maskSoftness: 0.35,
-};
+const SEGMENT_INTERVAL_MS = 380;
+const SEGMENT_INTERVAL_ACTIVE_MS = 110;
+const GESTURE_INTERVAL_MS = 150;
+const FACE_INTERVAL_MS = 240;
+const DEFAULT_TRANSITION_MS = 520;
+const DEFAULT_VOLUME = 0.7;
 
 function easeInOut(value) {
   return value < 0.5 ? 2 * value * value : 1 - ((-2 * value + 2) ** 2) / 2;
@@ -49,20 +48,51 @@ function closeTask(task) {
   }
 }
 
+function getMaskAnchor(mask) {
+  if (!mask?.bbox) {
+    return null;
+  }
+
+  const scaleX = FRAME_WIDTH / mask.width;
+  const scaleY = FRAME_HEIGHT / mask.height;
+  const { x0, y0, x1, y1 } = mask.bbox;
+
+  return {
+    x: x0 * scaleX,
+    y: y0 * scaleY,
+    width: (x1 - x0 + 1) * scaleX,
+    height: (y1 - y0 + 1) * scaleY,
+  };
+}
+
+function getFallbackAnchor() {
+  return {
+    x: FRAME_WIDTH * 0.25,
+    y: FRAME_HEIGHT * 0.08,
+    width: FRAME_WIDTH * 0.5,
+    height: FRAME_HEIGHT * 0.84,
+  };
+}
+
 export default function App() {
   const videoRef = useRef(null);
   const processedCanvasRef = useRef(null);
-  const frameCanvasRef = useRef(null);
+  const outputContextRef = useRef(null);
   const compositorRef = useRef(null);
   const segmenterRef = useRef(null);
   const handLandmarkerRef = useRef(null);
   const faceLandmarkerRef = useRef(null);
   const gestureServiceRef = useRef(new GestureService());
+  const effectRef = useRef(new TeleportEffect());
+  const audioServiceRef = useRef(null);
+  const volumeRef = useRef(DEFAULT_VOLUME);
   const latestMaskRef = useRef(null);
   const backgroundRef = useRef(null);
   const transitionRef = useRef({ from: 0, to: 0, startedAt: 0, duration: DEFAULT_TRANSITION_MS });
   const isInvisibleRef = useRef(false);
   const gestureEnabledRef = useRef(false);
+  const effectEnabledRef = useRef(true);
+  const segmentForceRef = useRef(false);
   const calibrationAbortRef = useRef(null);
   const segmentationStatusRef = useRef('Cargando modelo de segmentación...');
   const gestureStatusRef = useRef(GESTURE_STATES.DISABLED);
@@ -83,6 +113,16 @@ export default function App() {
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [isInvisible, setIsInvisible] = useState(false);
   const [transitionDuration, setTransitionDuration] = useState(DEFAULT_TRANSITION_MS);
+  const [effectEnabled, setEffectEnabled] = useState(true);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [volume, setVolume] = useState(DEFAULT_VOLUME);
+  const [audioStatus, setAudioStatus] = useState({
+    ready: 0,
+    total: 2,
+    missing: [],
+    missingPaths: [],
+    isComplete: false,
+  });
   const [fps, setFps] = useState(0);
   const [appError, setAppError] = useState('');
 
@@ -99,10 +139,46 @@ export default function App() {
   }, [isInvisible]);
 
   useEffect(() => {
+    effectEnabledRef.current = effectEnabled;
+  }, [effectEnabled]);
+
+  useEffect(() => {
+    volumeRef.current = volume;
+    audioServiceRef.current?.setVolume(volume);
+  }, [volume]);
+
+  useEffect(() => {
+    audioServiceRef.current?.setEnabled(soundEnabled);
+  }, [soundEnabled]);
+
+  useEffect(() => {
+    const service = new TeleportAudioService({ onStatusChange: setAudioStatus });
+    audioServiceRef.current = service;
+    service.setVolume(volumeRef.current);
+    service.setEnabled(soundEnabled);
+    service.init();
+
+    // El navegador exige una interaccion del usuario antes de dejar sonar.
+    const unlock = () => {
+      service.unlock();
+    };
+
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+      audioServiceRef.current = null;
+
+      if (service.context) {
+        service.context.close().catch(() => {});
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     compositorRef.current = new CompositorService(FRAME_WIDTH, FRAME_HEIGHT);
-    frameCanvasRef.current = document.createElement('canvas');
-    frameCanvasRef.current.width = FRAME_WIDTH;
-    frameCanvasRef.current.height = FRAME_HEIGHT;
   }, []);
 
   useEffect(() => {
@@ -162,6 +238,20 @@ export default function App() {
     return value;
   }, []);
 
+  // Fase 0..1 del efecto anime. Corre en sentido contrario al progreso de
+  // visibilidad para que al aparecer las bandas se reconstruyan al reves.
+  const getEffectPhase = useCallback((now) => {
+    const transition = transitionRef.current;
+
+    if (transition.from === transition.to) {
+      return transition.to;
+    }
+
+    const elapsed = Math.min(1, (now - transition.startedAt) / transition.duration);
+
+    return transition.to > transition.from ? elapsed : 1 - elapsed;
+  }, []);
+
   const toggleVisibility = useCallback(() => {
     setAppError('');
 
@@ -188,6 +278,15 @@ export default function App() {
 
     isInvisibleRef.current = nextInvisible;
     setIsInvisible(nextInvisible);
+
+    audioServiceRef.current?.play(nextInvisible ? 'disappear' : 'appear');
+
+    // El efecto se ancla donde esta la persona detectada.
+    const anchor = getMaskAnchor(latestMaskRef.current) || getFallbackAnchor();
+    effectRef.current.begin(anchor, Math.floor(Math.random() * 0xffffffff), FRAME_WIDTH);
+
+    // Fuerza una segmentacion inmediata para trabajar con la mascara al dia.
+    segmentForceRef.current = true;
   }, [getInvisibleProgress, transitionDuration]);
 
   const loadGestureModels = useCallback(async () => {
@@ -254,6 +353,7 @@ export default function App() {
     setIsInvisible(false);
     isInvisibleRef.current = false;
     transitionRef.current = { from: 0, to: 0, startedAt: performance.now(), duration: transitionDuration };
+    effectRef.current.active = false;
     camera.stopCamera();
   };
 
@@ -320,45 +420,60 @@ export default function App() {
     let animationFrameId = 0;
     let lastSegmentAt = 0;
     let lastGestureAt = 0;
+    let lastFaceAt = 0;
+    let lastFaceResults = null;
     let cancelled = false;
-    const frameCanvas = frameCanvasRef.current;
-    const frameContext = frameCanvas.getContext('2d', { willReadFrequently: true });
 
     function handleSegmentationResult(result, now) {
       const extractedMask = extractPersonMask(result, now);
+      latestMaskRef.current = extractedMask;
 
-      if (!extractedMask) {
-        setStatusIfChanged(segmentationStatusRef, setSegmentationStatus, 'Segmentación sin máscara de persona usable.');
+      return Boolean(extractedMask);
+    }
+
+    function runSegmentation(video, now, isTransitionActive) {
+      const segmenter = segmenterRef.current;
+
+      if (!segmenter) {
         return;
       }
 
-      latestMaskRef.current = extractedMask;
-      const source = extractedMask.source === 'confidence' ? 'confianza' : 'categoría';
-      setStatusIfChanged(segmentationStatusRef, setSegmentationStatus, `Máscara de persona activa (${source}).`);
-    }
+      const interval = isTransitionActive ? SEGMENT_INTERVAL_ACTIVE_MS : SEGMENT_INTERVAL_MS;
+      const forced = segmentForceRef.current;
 
-    function runSegmentation(video, now) {
-      const segmenter = segmenterRef.current;
-
-      if (!segmenter || now - lastSegmentAt < SEGMENT_INTERVAL_MS) {
+      if (!forced && now - lastSegmentAt < interval) {
         return;
       }
 
       lastSegmentAt = now;
+      segmentForceRef.current = false;
+
+      const startedAt = performance.now();
+      let hasPerson = false;
 
       try {
         let callbackHandled = false;
         const maybeResult = segmenter.segmentForVideo(video, now, (result) => {
           callbackHandled = true;
-          handleSegmentationResult(result, now);
+          hasPerson = handleSegmentationResult(result, now);
         });
 
         if (!callbackHandled && maybeResult) {
-          handleSegmentationResult(maybeResult, now);
+          hasPerson = handleSegmentationResult(maybeResult, now);
         }
       } catch (error) {
         setStatusIfChanged(segmentationStatusRef, setSegmentationStatus, `Error de segmentación: ${formatVisionError(error)}`);
+        return;
       }
+
+      const elapsed = Math.round(performance.now() - startedAt);
+      const bucket = elapsed < 20 ? 'rápido' : elapsed < 45 ? 'medio' : elapsed < 90 ? 'lento' : 'muy lento';
+
+      setStatusIfChanged(
+        segmentationStatusRef,
+        setSegmentationStatus,
+        `${hasPerson ? 'Máscara de persona activa' : 'Sin persona en el encuadre'} · ${bucket}`,
+      );
     }
 
     function runGesture(video, now) {
@@ -380,9 +495,17 @@ export default function App() {
         const handResults = handLandmarker.detectForVideo(video, now);
         let faceResults = null;
 
-        // Face Landmarker is expensive; only run it when the two-finger pose exists.
+        // Face Landmarker es caro: solo corre con la pose de dos dedos y a una
+        // frecuencia menor, reutilizando el ultimo rostro detectado.
         if (hasTwoFingerPose(handResults, FRAME_WIDTH, FRAME_HEIGHT)) {
-          faceResults = faceLandmarker.detectForVideo(video, now);
+          if (!lastFaceResults || now - lastFaceAt >= FACE_INTERVAL_MS) {
+            lastFaceAt = now;
+            lastFaceResults = faceLandmarker.detectForVideo(video, now);
+          }
+
+          faceResults = lastFaceResults;
+        } else {
+          lastFaceResults = null;
         }
 
         const decision = gestureServiceRef.current.update({
@@ -424,27 +547,44 @@ export default function App() {
       const processedCanvas = processedCanvasRef.current;
 
       if (video?.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && processedCanvas) {
-        frameContext.drawImage(video, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-        runSegmentation(video, now);
+        const transition = transitionRef.current;
+        const isTransitionActive = transition.from !== transition.to;
+        const invisibleProgress = getInvisibleProgress(now);
+        const effectPhase = getEffectPhase(now);
+
+        runSegmentation(video, now, isTransitionActive);
         runGesture(video, now);
 
         const latestMask = latestMaskRef.current;
         const maskIsStale = latestMask && now - latestMask.timestamp > MASK_STALE_MS;
-        const invisibleProgress = getInvisibleProgress(now);
         const usableMask = maskIsStale ? null : latestMask;
+        const animeActive = effectEnabledRef.current && effectRef.current.active;
 
-        if (maskIsStale) {
-          setStatusIfChanged(segmentationStatusRef, setSegmentationStatus, 'Máscara vencida; esperando segmentación actualizada.');
+        if (animeActive && usableMask && isTransitionActive) {
+          const anchor = getMaskAnchor(usableMask);
+          effectRef.current.follow(anchor);
         }
 
+        const bandFactors = animeActive && isTransitionActive ? effectRef.current.update(effectPhase) : null;
+        // Con el efecto anime el recorte arranca antes que el fundido global,
+        // asi que el corte temprano usa el maximo de ambos.
+        const hideProgress = animeActive ? Math.max(invisibleProgress, effectPhase) : invisibleProgress;
+
         compositorRef.current.composeFrame({
-          sourceCanvas: frameCanvas,
+          source: video,
           outputCanvas: processedCanvas,
           backgroundImageData: backgroundRef.current,
-          personMask: usableMask,
-          invisibleProgress,
-          visualParams,
+          bandFactors,
+          invisibleProgress: hideProgress,
         });
+
+        if (animeActive) {
+          if (!outputContextRef.current) {
+            outputContextRef.current = processedCanvas.getContext('2d');
+          }
+
+          effectRef.current.render(outputContextRef.current, FRAME_HEIGHT);
+        }
 
         updateFps(now);
       }
@@ -458,7 +598,7 @@ export default function App() {
       cancelled = true;
       cancelAnimationFrame(animationFrameId);
     };
-  }, [camera.isActive, getInvisibleProgress, toggleVisibility]);
+  }, [camera.isActive, getEffectPhase, getInvisibleProgress, toggleVisibility]);
 
   useEffect(() => {
     return () => {
@@ -514,6 +654,13 @@ export default function App() {
           isInvisible={isInvisible}
           transitionDuration={transitionDuration}
           onTransitionChange={setTransitionDuration}
+          effectEnabled={effectEnabled}
+          onEffectChange={setEffectEnabled}
+          soundEnabled={soundEnabled}
+          onSoundChange={setSoundEnabled}
+          volume={volume}
+          onVolumeChange={setVolume}
+          audioStatus={audioStatus}
         />
         <GesturePanel
           enabled={gestureEnabled}
